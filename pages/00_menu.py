@@ -12,8 +12,8 @@ CSV 파일을 업로드하거나, 기본 샘플 데이터를 사용해보세요.
 """)
 
 # ---- CSV 업로드 ----
-uploaded = st.file_uploader("📂 CSV 파일 업로드 (예: 가족형태, 연령대, 요일, 사용시간 컬럼 포함)", type=["csv"])
-
+#uploaded = st.file_uploader("📂 CSV 파일 업로드 (예: 가족형태, 연령대, 요일, 사용시간 컬럼 포함)", type=["csv"])
+uploaded=pd.read_csv("https://raw.githubusercontent.com/cegy/project/main/family.csv", encoding="cp949")
 if uploaded:
     df = pd.read_csv(uploaded)
 else:
