@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="PDF 표 → Plotly 시각화(설명/단위 표시 강화)", layout="wide")
+st.set_page_config(page_title="PDF 표 → Plotly 시각화(설명/단위 표시 + 자동 필터)", layout="wide")
 
 # --------- 설정 ---------
 PDF_FILENAME = "서울시민의+결혼과+가족+형태의+변화+분석.pdf"
@@ -45,6 +45,8 @@ def is_year_like(s) -> bool:
 # 전처리
 # =========================
 def clean_table(df_raw: pd.DataFrame) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame()
     df = df_raw.copy()
     df = df.applymap(lambda x: "" if pd.isna(x) else str(x).strip())
     # 첫 행이 헤더로 보이면 헤더로 승격
@@ -90,12 +92,13 @@ def coerce_numeric_cols_with_percent_map(
 # 세로/가로 구조 감지 & long 변환
 # =========================
 def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    # 연도 컬럼 후보
+    if df is None or df.empty:
+        return None
     cols = list(df.columns)
-    # 1) 이름으로 추정
+    # 1) 이름으로 연도 추정
     name_hits = [c for c in cols if re.search(r"(연도|년도|year|Year|시점|기간)", str(c))]
     year_col = name_hits[0] if name_hits else None
-    # 2) 값으로 추정
+    # 2) 값으로 연도 추정
     if year_col is None:
         for c in cols:
             try:
@@ -115,7 +118,7 @@ def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
     df2, percent_cols = coerce_numeric_cols_with_percent_map(df, exclude=[year_col])
 
-    # 시각화 가능한 값 컬럼 필터(유효값 ≥2 & 분산>0)
+    # 시각화 가능한 값 컬럼(유효값 ≥2 & 분산>0)
     keep = []
     for c in value_cols:
         s = pd.to_numeric(df2[c], errors="coerce")
@@ -136,13 +139,14 @@ def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
     # 메타 정보
     long.attrs["year_col"] = year_col
-    # 퍼센트 여부는 컬럼명 기준으로 기록
     percent_metrics = {m for m in keep if m in percent_cols}
     long.attrs["percent_metrics"] = percent_metrics
     long.attrs["structure"] = "vertical"
     return long
 
 def to_long_horizontal(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
     # 열 머리글의 연도 탐색
     year_cols = [c for c in df.columns if is_year_like(c)]
     if len(year_cols) < 2:
@@ -160,17 +164,9 @@ def to_long_horizontal(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
     # 퍼센트 맵: metric별로 % 포함 여부 판단
     percent_metrics: Set[str] = set()
-    # melt 전에 % 탐지
-    for idx, row in df2.iterrows():
-        # metric 이름
+    for _, row in df2.iterrows():
         mname = str(row[metric_col]).strip()
-        # 해당 행의 연도 값들 중 %가 하나라도 있으면 해당 metric은 percent로 간주
-        saw_pct = False
-        for yc in year_cols:
-            cell = row[yc]
-            if isinstance(cell, str) and "%" in cell:
-                saw_pct = True
-                break
+        saw_pct = any(isinstance(row[yc], str) and "%" in row[yc] for yc in year_cols)
         if saw_pct:
             percent_metrics.add(mname)
 
@@ -246,7 +242,7 @@ def extract_tables_from_pdf(path: str) -> List[Tuple[int, pd.DataFrame]]:
 # UI
 # =========================
 st.title("📄 PDF 표 → 📊 Plotly 시각화")
-st.caption("무엇을 시각화했는지 **설명/단위**를 함께 표기합니다.")
+st.caption("시각화 가능한 데이터만 자동 선별하고, 무엇을 그렸는지 설명/단위까지 표시합니다.")
 
 st.write(f"PDF 파일: **{PDF_FILENAME}**")
 st.caption(f"경로: `{PDF_PATH}`")
@@ -331,10 +327,11 @@ year_min = int(yr_nonnull.min()) if not yr_nonnull.empty else None
 year_max = int(yr_nonnull.max()) if not yr_nonnull.empty else None
 
 # =========================
-# 📝 무엇을 시각화했나요? (오류 수정된 설명 블록)
+# 📝 무엇을 시각화했나요?  (join 안전화 반영)
 # =========================
-selected_str = ", ".join(selected_metrics)
-percent_str = ", ".join(sorted(percent_metrics)) if percent_metrics else "없음"
+selected_str = ", ".join([str(x) for x in (selected_metrics or [])])
+percent_str = ", ".join([str(x) for x in sorted(percent_metrics)]) if percent_metrics else "없음"
+
 markdown_text = (
     "- **원본**: `" + PDF_FILENAME + "`, **페이지**: p." + str(page_no) + ", **표 구조**: " + str(structure) + "\n"
     + "- **연도 컬럼**: `" + str(year_col) + "` | **연도 범위**: **" + str(year_min) + "–" + str(year_max) + "**\n"
@@ -346,15 +343,16 @@ markdown_text = (
 st.subheader("📝 무엇을 시각화했나요?")
 st.markdown(markdown_text)
 
+# 지표별 데이터포인트/단위 표
 desc_rows = []
 for m in selected_metrics:
     cnt = df_plot[df_plot["metric"] == m][year_col].nunique()
     unit = "%" if (m in percent_metrics and show_percent) else ("(비율 0–1)" if m in percent_metrics else "(값)")
-    desc_rows.append({"metric": m, "points": cnt, "unit_shown": unit})
+    desc_rows.append({"metric": str(m), "points": int(cnt), "unit_shown": unit})
 st.dataframe(pd.DataFrame(desc_rows), use_container_width=True, height=180)
 
 # =========================
-# Plotly 시각화 (설명 포함 타이틀/호버)
+# Plotly 시각화 (호버에 단위 표시)
 # =========================
 title_suffix = f"(p.{page_no} · {year_min}–{year_max} · {len(selected_metrics)} metrics)"
 
@@ -364,7 +362,7 @@ fig_line = px.line(
     x=year_col, y="display_value", color="metric", markers=True,
     title=f"Selected Metrics Over Time {title_suffix}"
 )
-# hover 단위 표시용 customdata 준비
+# hover 단위 표시용 customdata
 df_plot_sorted = df_plot.sort_values([year_col, "metric"]).copy()
 df_plot_sorted["unit_str"] = df_plot_sorted["metric"].apply(
     lambda m: "%" if (m in percent_metrics and show_percent) else ""
@@ -403,7 +401,6 @@ st.download_button(
     file_name="table_cleaned.csv",
     mime="text/csv"
 )
-# 시각화에 실제 사용한 subset + 표시값 포함
 export_cols = [year_col, "metric", "value", "display_value"]
 st.download_button(
     "시각화용 long CSV 내려받기 (표시값 포함)",
