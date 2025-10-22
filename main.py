@@ -331,25 +331,26 @@ year_min = int(yr_nonnull.min()) if not yr_nonnull.empty else None
 year_max = int(yr_nonnull.max()) if not yr_nonnull.empty else None
 
 # =========================
-# 📌 설명 패널 (무엇을 시각화했는가?)
+# 📝 무엇을 시각화했나요? (오류 수정된 설명 블록)
 # =========================
+selected_str = ", ".join(selected_metrics)
+percent_str = ", ".join(sorted(percent_metrics)) if percent_metrics else "없음"
+markdown_text = (
+    "- **원본**: `" + PDF_FILENAME + "`, **페이지**: p." + str(page_no) + ", **표 구조**: " + str(structure) + "\n"
+    + "- **연도 컬럼**: `" + str(year_col) + "` | **연도 범위**: **" + str(year_min) + "–" + str(year_max) + "**\n"
+    + "- **선택 지표(" + str(len(selected_metrics)) + "개)**: " + selected_str + "\n"
+    + "- **퍼센트 인식 지표**: " + percent_str + "\n"
+    + "  - 퍼센트 인식 지표는 내부 저장 시 `0–1` 스케일로 변환됩니다.\n"
+    + "  - ✅ 옵션 ‘퍼센트 지표를 %로 보기’를 켜면, 해당 지표만 **×100** 하여 **% 단위**로 표시합니다."
+)
+st.subheader("📝 무엇을 시각화했나요?")
+st.markdown(markdown_text)
+
 desc_rows = []
 for m in selected_metrics:
     cnt = df_plot[df_plot["metric"] == m][year_col].nunique()
     unit = "%" if (m in percent_metrics and show_percent) else ("(비율 0–1)" if m in percent_metrics else "(값)")
     desc_rows.append({"metric": m, "points": cnt, "unit_shown": unit})
-
-st.subheader("📝 무엇을 시각화했나요?")
-st.markdown(
-    f"""
-- **원본**: `{PDF_FILENAME}`, **페이지**: p.{page_no}, **표 구조**: {structure}
-- **연도 컬럼**: `{year_col}` | **연도 범위**: **{year_min}–{year_max}**
-- **선택 지표({len(selected_metrics)}개)**: {", ".join(selected_metrics)}
-- **퍼센트 인식 지표**: {", ".join(sorted(percent_metrics)) if percent_metrics else "없음"}
-  - 퍼센트 인식 지표는 내부 저장 시 `0–1` 스케일로 변환됩니다.
-  - ✅ 옵션 ‘퍼센트 지표를 %로 보기’를 켜면, 해당 지표만 **×100** 하여 **% 단위**로 표시합니다.
-"""
-)
 st.dataframe(pd.DataFrame(desc_rows), use_container_width=True, height=180)
 
 # =========================
@@ -363,8 +364,7 @@ fig_line = px.line(
     x=year_col, y="display_value", color="metric", markers=True,
     title=f"Selected Metrics Over Time {title_suffix}"
 )
-hover_unit = "%{customdata}"  # 각 포인트 단위 표시용
-# customdata: 각 점에 대해 단위 결정
+# hover 단위 표시용 customdata 준비
 df_plot_sorted = df_plot.sort_values([year_col, "metric"]).copy()
 df_plot_sorted["unit_str"] = df_plot_sorted["metric"].apply(
     lambda m: "%" if (m in percent_metrics and show_percent) else ""
@@ -373,7 +373,7 @@ fig_line.update_traces(
     customdata=df_plot_sorted["unit_str"],
     hovertemplate="<b>%{fullData.name}</b><br>"
                   + f"{year_col}=%{{x}}<br>"
-                  + "value=%{y:.3f}" + " %{customdata}<extra></extra>"
+                  + "value=%{y:.3f} %{customdata}<extra></extra>"
 )
 fig_line.update_layout(xaxis_title=str(year_col), yaxis_title=y_label, hovermode="x unified", margin=dict(t=60))
 st.plotly_chart(fig_line, use_container_width=True)
@@ -388,7 +388,7 @@ fig_bar.update_traces(
     customdata=df_plot_sorted["unit_str"],
     hovertemplate="<b>%{fullData.name}</b><br>"
                   + f"{year_col}=%{{x}}<br>"
-                  + "value=%{y:.3f}" + " %{customdata}<extra></extra>"
+                  + "value=%{y:.3f} %{customdata}<extra></extra>"
 )
 fig_bar.update_layout(xaxis_title=str(year_col), yaxis_title=y_label, hovermode="x unified", margin=dict(t=60))
 st.plotly_chart(fig_bar, use_container_width=True)
