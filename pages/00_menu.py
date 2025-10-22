@@ -10,7 +10,7 @@ st.title("🏠 가족생활 가치관 데이터 대시보드")
 # 데이터 불러오기
 # -----------------------------
 #uploaded = st.file_uploader("📂 가족생활 가치관 CSV 또는 엑셀 파일 업로드", type=["csv", "xlsx"])
-uploaded=pd.read_csv("https://raw.githubusercontent.com/cegy/project/main/family.csv", encoding="cp949")
+uploaded=pd.read_csv("https://raw.githubusercontent.com/cegy/project/main/family.csv", encoding="utf-8-sig")
 if uploaded:
     if uploaded.name.endswith(".csv"):
         df = pd.read_csv(uploaded, encoding="utf-8-sig")
