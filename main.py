@@ -1,15 +1,14 @@
 import io
 import os
 import re
+from typing import List, Tuple, Optional
+
 import pdfplumber
 import pandas as pd
 import streamlit as st
-import numpy as np
-
 import plotly.express as px
-import plotly.graph_objects as go
 
-st.set_page_config(page_title="서울시민 결혼·가족 변화 분석 (Plotly 버전)", layout="wide")
+st.set_page_config(page_title="PDF 표 추출 → Plotly 시각화", layout="wide")
 
 # ---------------------------
 # 고정 파일 경로 (main.py와 동일 폴더)
@@ -17,304 +16,241 @@ st.set_page_config(page_title="서울시민 결혼·가족 변화 분석 (Plotly
 PDF_FILENAME = "서울시민의+결혼과+가족+형태의+변화+분석.pdf"
 PDF_PATH = os.path.join(os.path.dirname(__file__), PDF_FILENAME)
 
-METRICS_CSV_NAME = "seoul_family_metrics.csv"
-METRICS_CSV_PATH = os.path.join(os.path.dirname(__file__), METRICS_CSV_NAME)
-
 # ---------------------------
-# 캐시 유틸
+# 유틸: 숫자 정규화/컬럼 자동감지
 # ---------------------------
-@st.cache_data(show_spinner=False)
-def read_pdf_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
+NUM_RE = re.compile(r"^-?\s*[\d,]+(?:\.\d+)?\s*%?$")
 
-@st.cache_data(show_spinner=False)
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    text_chunks = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text(x_tolerance=1.5, y_tolerance=1.5) or ""
-            t = re.sub(r"[ \t]+", " ", t)
-            text_chunks.append(t.strip())
-    return "\n\n".join(text_chunks)
+def to_number(x):
+    """문자 → 숫자(float). 쉼표/퍼센트 처리. 변환 실패 시 NaN."""
+    if pd.isna(x):
+        return pd.NA
+    s = str(x).strip()
+    if not NUM_RE.match(s):
+        return pd.NA
+    is_pct = s.endswith("%")
+    s = s.replace("%", "").replace(",", "")
+    try:
+        val = float(s)
+        return val / 100.0 if is_pct else val
+    except Exception:
+        return pd.NA
 
-def split_sentences_rough_korean(text: str):
-    # 마침표/물음표/느낌표/개행 기준 간단 분리
-    sents = re.split(r'(?<=[.!?])\s+|\n+', text)
-    return [s.strip() for s in sents if len(s.strip()) > 1]
-
-def keyword_hits(sentences, kw):
-    kw_norm = kw.lower()
-    rows = []
-    for i, s in enumerate(sentences):
-        if kw_norm in s.lower():
-            rows.append({"keyword": kw, "sentence_idx": i, "sentence": s})
-    return rows
-
-def make_snippet(hit, window=160):
-    s = hit["sentence"]
-    if len(s) <= window:
-        return s
-    return s[: window//2] + " … " + s[-window//2 :]
-
-@st.cache_data(show_spinner=False)
-def load_metrics_csv(path: str):
-    if not os.path.exists(path):
-        return None
-    df = pd.read_csv(path)
-    if "year" in df.columns:
-        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
-        df = df.sort_values("year")
-    return df
-
-def make_metrics_template_df():
-    cols = [
-        "year",
-        "marriage_rate",            # 혼인율
-        "first_marriage_age_m",     # 남자 평균 초혼연령
-        "first_marriage_age_f",     # 여자 평균 초혼연령
-        "divorce_rate",             # 이혼율
-        "tfr",                      # 합계출산율
-        "one_person_share"          # 1인 가구 비중(%)
-    ]
-    years = [2015, 2018, 2020, 2022, 2024]
-    df = pd.DataFrame({c: [None]*len(years) for c in cols})
-    df["year"] = years
-    return df[cols]
-
-def melt_for_line(df, year_col, metric_cols):
-    d = df[[year_col] + metric_cols].copy()
-    # 숫자형으로 변환
-    for c in metric_cols:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    long = d.melt(id_vars=year_col, value_vars=metric_cols,
-                  var_name="metric", value_name="value")
-    return long
-
-def corr_dataframe(df, cols):
-    d = df[cols].apply(pd.to_numeric, errors="coerce")
-    return d.corr()
-
-# ---------------------------
-# 사이드바 - 공통 분석 설정
-# ---------------------------
-st.sidebar.header("🔎 텍스트 분석 설정")
-default_keywords = [
-    "혼인율", "초혼", "재혼", "이혼", "출산", "합계출산율",
-    "1인 가구", "비혼", "만혼", "동거", "가족형태", "출생", "고령화"
-]
-keywords = st.sidebar.text_area(
-    "관심 키워드(줄바꿈으로 구분)",
-    value="\n".join(default_keywords),
-    height=180
-).splitlines()
-keywords = [k.strip() for k in keywords if k.strip()]
-context_window = st.sidebar.slider("문맥 스니펫 길이(문자수)", 60, 400, 160, 20)
-
-st.sidebar.header("📈 지표 대시보드 설정")
-metric_defaults = ["marriage_rate", "tfr", "one_person_share"]
-selected_metrics = st.sidebar.text_input(
-    "표시할 지표(쉼표로 구분)",
-    value=", ".join(metric_defaults)
-)
-selected_metrics = [m.strip() for m in selected_metrics.split(",") if m.strip()]
-
-# ---------------------------
-# 상단 정보
-# ---------------------------
-st.title("📊 서울시민의 결혼·가족 형태 변화 — Plotly 대시보드")
-st.caption("같은 폴더의 PDF와 CSV를 직접 읽어 분석합니다.")
-st.write(f"PDF 파일: **{PDF_FILENAME}**")
-st.caption(f"경로: `{PDF_PATH}`")
-
-# ---------------------------
-# 탭 구성
-# ---------------------------
-tab1, tab2 = st.tabs(["📰 텍스트 분석 (PDF)", "📊 지표 대시보드 (CSV)"])
-
-# ===========================
-# 탭 1: 텍스트 분석
-# ===========================
-with tab1:
-    if not os.path.exists(PDF_PATH):
-        st.error("지정된 PDF 파일을 찾을 수 없습니다. `main.py`와 같은 폴더에 "
-                 f"`{PDF_FILENAME}` 파일이 있는지 확인하세요.")
-        st.stop()
-
-    with st.spinner("PDF에서 텍스트 추출 중…"):
-        raw_bytes = read_pdf_bytes(PDF_PATH)
-        raw_text = extract_text_from_pdf(raw_bytes)
-
-    sentences = split_sentences_rough_korean(raw_text)
-    st.success(f"텍스트 추출 완료: 약 {len(sentences)}개 문장")
-
-    # 키워드 검색/시각화
-    hits_all = []
-    for kw in keywords:
-        hits_all.extend(keyword_hits(sentences, kw))
-
-    if hits_all:
-        df_hits = pd.DataFrame(hits_all)
-        counts = (
-            df_hits["keyword"]
-            .value_counts()
-            .rename_axis("keyword")
-            .reset_index(name="count")
-            .sort_values("count", ascending=False)
-        )
-
-        st.subheader("📈 키워드 출현 빈도 (Plotly)")
-        fig_bar = px.bar(
-            counts,
-            x="keyword",
-            y="count",
-            text="count",
-            title="Keyword Frequency",
-        )
-        fig_bar.update_traces(textposition="outside")
-        fig_bar.update_layout(xaxis_title="키워드", yaxis_title="빈도", margin=dict(t=60))
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.subheader("🧩 문맥 스니펫")
-        df_hits["snippet"] = df_hits.apply(lambda r: make_snippet(r, context_window), axis=1)
-        show_cols = ["keyword", "sentence_idx", "snippet"]
-        st.dataframe(df_hits[show_cols], use_container_width=True, height=360)
-
-        csv = df_hits[show_cols + ["sentence"]].to_csv(index=False).encode("utf-8-sig")
-        st.download_button("CSV로 내보내기", data=csv, file_name="keyword_snippets.csv", mime="text/csv")
-    else:
-        st.info("설정한 키워드가 본문에서 발견되지 않았습니다. 사이드바에서 키워드를 조정해 보세요.")
-
-    # 간단 요약
-    st.subheader("📝 간단 요약(룰 기반)")
-    years = sorted(set(re.findall(r"\b(19\d{2}|20\d{2})\b", raw_text)))
-    bullets = []
-    if years:
-        bullets.append(f"- 보고서에 등장하는 연도 범위: **{years[0]}–{years[-1]}**")
-    for term in ["혼인율", "초혼", "이혼", "출산", "합계출산율", "1인 가구", "비혼", "동거", "만혼"]:
-        if re.search(term, raw_text):
-            bullets.append(f"- **{term}** 관련 서술이 포함되어 있음")
-    if not bullets:
-        bullets.append("- 주요 용어를 찾지 못했습니다. 키워드/스니펫 결과를 참고하세요.")
-    for b in bullets:
-        st.markdown(b)
-
-    with st.expander("📄 본문 미리보기"):
-        st.text_area("텍스트(일부)", value=raw_text[:8000], height=260)
-
-# ===========================
-# 탭 2: 지표 대시보드
-# ===========================
-with tab2:
-    st.write(f"CSV 파일(선택): **{METRICS_CSV_NAME}**")
-    st.caption(f"경로: `{METRICS_CSV_PATH}`")
-
-    dfm = load_metrics_csv(METRICS_CSV_PATH)
-
-    if dfm is None:
-        st.warning("지표 CSV가 없습니다. 아래 템플릿을 내려받아 수치를 채운 뒤 "
-                   f"`{METRICS_CSV_NAME}` 이름으로 같은 폴더에 저장하세요.")
-        template_df = make_metrics_template_df()
-        st.dataframe(template_df, use_container_width=True, height=240)
-
-        csv_bytes = template_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "지표 템플릿 CSV 다운로드",
-            data=csv_bytes,
-            file_name=METRICS_CSV_NAME,
-            mime="text/csv"
-        )
-    else:
-        st.success("지표 CSV 로드 완료")
-        st.dataframe(dfm, use_container_width=True, height=300)
-
-        # 선택 지표 유효성 필터
-        numeric_cols = [c for c in dfm.columns if c != "year"]
-        active_cols = [c for c in selected_metrics if c in dfm.columns and c != "year"]
-        if not active_cols:
-            active_cols = [c for c in metric_defaults if c in dfm.columns]
-
-        # ----- 시계열 라인차트 (Plotly) -----
-        st.subheader("📈 시계열 라인차트 (Plotly)")
+def guess_year_col(cols: List[str], df: pd.DataFrame) -> Optional[str]:
+    """
+    연도 컬럼(예: 연도, 년도, year, 2015.. 등)을 추정.
+    1) 이름 기반 2) 값 분포 기반
+    """
+    name_hits = [c for c in cols if re.search(r"(연도|년도|year|Year|기간|시점)", str(c))]
+    if name_hits:
+        return name_hits[0]
+    # 값이 1900~2100 사이 정수로 많이 들어 있으면 연도 취급
+    for c in cols:
         try:
-            long = melt_for_line(dfm, "year", active_cols)
-            fig_line = px.line(
-                long,
-                x="year",
-                y="value",
-                color="metric",
-                markers=True,
-                title="Selected Metrics Over Time"
-            )
-            fig_line.update_layout(
-                xaxis_title="year",
-                yaxis_title="value",
-                hovermode="x unified",
-                margin=dict(t=60)
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
-        except Exception as e:
-            st.error(f"라인차트에서 오류가 발생했습니다: {e}")
-
-        # ----- 전년 대비 증감률 -----
-        st.subheader("↕️ 전년 대비 증감률(%)")
-        pct_df = dfm[["year"] + active_cols].copy()
-        for col in active_cols:
-            pct_df[col] = pd.to_numeric(pct_df[col], errors="coerce")
-            pct_df[col] = pct_df[col].pct_change() * 100.0
-        st.dataframe(pct_df, use_container_width=True, height=220)
-
-        # 증감률 라인(옵션)
-        try:
-            long_pct = melt_for_line(pct_df, "year", active_cols)
-            fig_pct = px.line(
-                long_pct,
-                x="year",
-                y="value",
-                color="metric",
-                markers=True,
-                title="YoY Change (%)"
-            )
-            fig_pct.update_layout(xaxis_title="year", yaxis_title="pct_change(%)", hovermode="x unified")
-            st.plotly_chart(fig_pct, use_container_width=True)
+            vals = pd.to_numeric(df[c], errors="coerce").dropna()
+            if len(vals) >= max(3, len(df) // 3):
+                if (vals.between(1900, 2100)).mean() > 0.6:
+                    return c
         except Exception:
             pass
+    return None
 
-        # ----- 상관행렬 (Plotly Heatmap) -----
-        st.subheader("🔗 지표 상관행렬")
-        try:
-            corr_cols = [c for c in active_cols if c in dfm.columns]
-            if len(corr_cols) >= 2:
-                corr = corr_dataframe(dfm, corr_cols)
-                # 히트맵 + 값 표시
-                heat = go.Heatmap(
-                    z=corr.values,
-                    x=corr_cols,
-                    y=corr_cols,
-                    zmin=-1, zmax=1,
-                    colorbar=dict(title="corr")
+def clean_table(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    - 헤더 행 추정(첫 행에 문자열 비율이 높으면 헤더로 사용)
+    - 공백/줄바꿈 제거
+    - 전열 문자열 strip
+    """
+    df = df_raw.copy()
+    # 모든 값 문자열화
+    df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+    # 첫 행을 헤더로 쓸지 판단
+    header_row = df.iloc[0]
+    str_ratio = (header_row != "").mean()
+    if str_ratio >= 0.5:
+        df.columns = header_row
+        df = df.iloc[1:].reset_index(drop=True)
+    # 빈 컬럼명 처리
+    df.columns = [c if c != "" else f"col_{i}" for i, c in enumerate(df.columns)]
+    # 완전 빈 행 제거
+    df = df[~(df.apply(lambda r: (r == "").all(), axis=1))].reset_index(drop=True)
+    return df
+
+def coerce_numeric_cols(df: pd.DataFrame, year_col: Optional[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if c == year_col:
+            continue
+        out[c] = out[c].apply(to_number)
+    # year_col도 숫자로 가능하면
+    if year_col and year_col in out.columns:
+        out[year_col] = pd.to_numeric(out[year_col], errors="coerce")
+    return out
+
+def longify(df: pd.DataFrame, year_col: str, value_cols: List[str]) -> pd.DataFrame:
+    long = df[[year_col] + value_cols].melt(
+        id_vars=year_col, value_vars=value_cols, var_name="metric", value_name="value"
+    )
+    # 숫자로 강제
+    long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    # 연도 정렬
+    long = long.sort_values([year_col, "metric"]).reset_index(drop=True)
+    return long
+
+# ---------------------------
+# PDF → 표 추출
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def extract_tables_from_pdf(path: str) -> List[Tuple[int, pd.DataFrame]]:
+    """
+    각 페이지에서 table.extract()로 얻은 테이블을 DataFrame 리스트로 반환.
+    [(page_index, df), ...]
+    """
+    results: List[Tuple[int, pd.DataFrame]] = []
+    with pdfplumber.open(path) as pdf:
+        for p_idx, page in enumerate(pdf.pages):
+            try:
+                tables = page.extract_tables(
+                    {
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "intersection_tolerance": 5,
+                    }
                 )
-                fig_corr = go.Figure(data=[heat])
-                # 값 annotation
-                annotations = []
-                for i, row in enumerate(corr.values):
-                    for j, val in enumerate(row):
-                        annotations.append(
-                            dict(
-                                x=corr_cols[j],
-                                y=corr_cols[i],
-                                text=f"{val:.2f}",
-                                xref="x1", yref="y1",
-                                showarrow=False
-                            )
-                        )
-                fig_corr.update_layout(
-                    title="Correlation Matrix",
-                    annotations=annotations,
-                    margin=dict(t=60)
-                )
-                st.plotly_chart(fig_corr, use_container_width=True)
-            else:
-                st.info("상관행렬을 보려면 2개 이상의 지표가 필요합니다.")
-        except Exception as e:
-            st.error(f"상관행렬에서 오류가 발생했습니다: {e}")
+            except Exception:
+                tables = page.extract_tables()
+            for t in tables or []:
+                if not t:
+                    continue
+                df = pd.DataFrame(t)
+                # 완전 공백 테이블 제외
+                if df.replace("", pd.NA).dropna(how="all").empty:
+                    continue
+                results.append((p_idx + 1, df))
+    return results
+
+# ---------------------------
+# 상단 UI
+# ---------------------------
+st.title("📄 PDF 표 추출 → 📊 Plotly 시각화")
+st.caption("PDF 안의 **표**를 추출해서 그대로 시각화합니다. (텍스트 키워드 분석 없음)")
+
+st.write(f"대상 PDF: **{PDF_FILENAME}**")
+st.caption(f"경로: `{PDF_PATH}`")
+
+if not os.path.exists(PDF_PATH):
+    st.error("지정된 PDF 파일을 찾을 수 없습니다. `main.py`와 같은 폴더에 "
+             f"`{PDF_FILENAME}` 파일이 있는지 확인하세요.")
+    st.stop()
+
+with st.spinner("PDF에서 표 감지/추출 중…"):
+    tables = extract_tables_from_pdf(PDF_PATH)
+
+if not tables:
+    st.error("표를 찾지 못했습니다. 스캔(이미지) PDF일 가능성이 큽니다.\n"
+             "- 원본이 벡터 PDF인지 확인하거나\n"
+             "- 표를 CSV로 정리하여 불러오는 방식을 고려하세요.")
+    st.stop()
+
+# 표 선택
+table_labels = [f"p.{p} - table#{i+1} (shape={df.shape[0]}x{df.shape[1]})"
+                for i, (p, df) in enumerate(tables)]
+sel = st.selectbox("시각화할 표 선택", options=list(range(len(tables))),
+                   format_func=lambda i: table_labels[i])
+
+page_no, df_raw = tables[sel]
+st.info(f"선택: p.{page_no} 표 | 원본 shape: {df_raw.shape}")
+
+# 표 전처리 프리뷰
+df_clean = clean_table(df_raw)
+st.subheader("🧹 전처리된 표 미리보기")
+st.dataframe(df_clean, use_container_width=True, height=300)
+
+# 연도 컬럼/값 컬럼 지정
+st.subheader("⚙️ 컬럼 매핑")
+cols = list(df_clean.columns)
+default_year = guess_year_col(cols, df_clean)
+year_col = st.selectbox("연도(가로축)로 사용할 컬럼", options=cols,
+                        index=cols.index(default_year) if default_year in cols else 0)
+
+# 수치형 후보 자동 선택(연도 제외)
+numeric_candidates = [c for c in cols if c != year_col]
+st.caption("※ 숫자로 변환 가능한 컬럼만 시각화에 사용됩니다(%, 콤마 자동 처리).")
+
+# 숫자 변환
+df_numeric = coerce_numeric_cols(df_clean, year_col)
+
+# 실제 숫자값이 충분히 존재하는 컬럼만 필터
+value_cols_valid = []
+for c in numeric_candidates:
+    series = pd.to_numeric(df_numeric[c], errors="coerce")
+    if series.notna().sum() >= 2:  # 최소 2개 이상 값
+        value_cols_valid.append(c)
+
+if not value_cols_valid:
+    st.warning("시각화 가능한 수치 컬럼을 찾지 못했습니다. 다른 표를 선택해 보세요.")
+    st.stop()
+
+selected_values = st.multiselect("시각화할 값 컬럼(복수 선택 가능)", options=value_cols_valid,
+                                 default=value_cols_valid[: min(3, len(value_cols_valid))])
+
+if not selected_values:
+    st.info("값 컬럼을 하나 이상 선택하세요.")
+    st.stop()
+
+# 롱 포맷으로 변환
+df_long = longify(df_numeric, year_col, selected_values)
+
+# 결측/연도 범위 안내
+years_nonnull = df_long[year_col].dropna().unique()
+if len(years_nonnull) > 0:
+    st.caption(f"인식된 연도 범위: **{int(pd.Series(years_nonnull).min())}–{int(pd.Series(years_nonnull).max())}**")
+
+# ---------------------------
+# Plotly 시각화
+# ---------------------------
+st.subheader("📈 시계열 라인 차트")
+fig_line = px.line(
+    df_long, x=year_col, y="value", color="metric",
+    markers=True, title="Selected metrics over time"
+)
+fig_line.update_layout(xaxis_title=str(year_col), yaxis_title="value", hovermode="x unified")
+st.plotly_chart(fig_line, use_container_width=True)
+
+st.subheader("📊 연도별 막대 차트 (스택/그룹 전환)")
+bar_mode = st.radio("막대 모드", options=["group", "stack"], horizontal=True, index=0)
+fig_bar = px.bar(
+    df_long, x=year_col, y="value", color="metric",
+    barmode=bar_mode, title="Yearly values"
+)
+fig_bar.update_layout(xaxis_title=str(year_col), yaxis_title="value", hovermode="x unified")
+st.plotly_chart(fig_bar, use_container_width=True)
+
+# ---------------------------
+# 다운로드
+# ---------------------------
+st.subheader("⬇️ 데이터 다운로드")
+st.download_button(
+    "전처리 표 CSV 내려받기",
+    data=df_numeric.to_csv(index=False).encode("utf-8-sig"),
+    file_name="table_cleaned.csv",
+    mime="text/csv"
+)
+st.download_button(
+    "롱 포맷 CSV 내려받기 (시각화용)",
+    data=df_long.to_csv(index=False).encode("utf-8-sig"),
+    file_name="table_long.csv",
+    mime="text/csv"
+)
+
+with st.expander("ℹ️ 도움말"):
+    st.markdown(
+        """
+- 이 앱은 **PDF 내부의 표**를 추출해 숫자 컬럼을 자동 인식(%, 콤마 제거) 후 시각화합니다.  
+- **연도 컬럼**은 자동 추정되지만, 필요 시 상단 셀렉트박스에서 직접 바꿀 수 있습니다.  
+- 스캔(이미지) PDF는 표 추출이 어렵습니다. 이런 경우:
+  1) 원본(텍스트/벡터) PDF를 사용하거나  
+  2) 표를 CSV로 직접 정리해 불러오세요.  
+- 값이 퍼센트(%)인 경우 자동으로 0~1 스케일로 환산됩니다.
+        """
+    )
