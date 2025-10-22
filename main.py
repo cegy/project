@@ -1,14 +1,14 @@
 import io
 import os
 import re
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 
 import pdfplumber
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="PDF 표 → 시각화(자동 필터링)", layout="wide")
+st.set_page_config(page_title="PDF 표 → Plotly 시각화(설명/단위 표시 강화)", layout="wide")
 
 # --------- 설정 ---------
 PDF_FILENAME = "서울시민의+결혼과+가족+형태의+변화+분석.pdf"
@@ -16,20 +16,23 @@ PDF_PATH = os.path.join(os.path.dirname(__file__), PDF_FILENAME)
 
 NUM_RE = re.compile(r"^-?\s*[\d,]+(?:\.\d+)?\s*%?$")
 
-# --------- 숫자/연도 유틸 ---------
-def to_number(x):
+# =========================
+# 숫자/연도 유틸
+# =========================
+def to_number_and_is_percent(x):
+    """값을 숫자로 변환하고, 원본이 %였는지 플래그 반환."""
     if pd.isna(x):
-        return pd.NA
+        return pd.NA, False
     s = str(x).strip()
     if not NUM_RE.match(s):
-        return pd.NA
+        return pd.NA, False
     is_pct = s.endswith("%")
     s = s.replace("%", "").replace(",", "")
     try:
         val = float(s)
-        return val / 100.0 if is_pct else val
+        return (val / 100.0 if is_pct else val), is_pct
     except Exception:
-        return pd.NA
+        return pd.NA, False
 
 def is_year_like(s) -> bool:
     try:
@@ -38,7 +41,9 @@ def is_year_like(s) -> bool:
     except Exception:
         return False
 
-# --------- 전처리 ---------
+# =========================
+# 전처리
+# =========================
 def clean_table(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
     df = df.applymap(lambda x: "" if pd.isna(x) else str(x).strip())
@@ -53,16 +58,37 @@ def clean_table(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df[~(df.apply(lambda r: (r == "").all(), axis=1))].reset_index(drop=True)
     return df
 
-def coerce_numeric_cols(df: pd.DataFrame, exclude: Optional[List[str]] = None) -> pd.DataFrame:
+def coerce_numeric_cols_with_percent_map(
+    df: pd.DataFrame, exclude: Optional[List[str]] = None
+) -> Tuple[pd.DataFrame, Set[str]]:
+    """
+    exclude 제외 모든 열을 숫자로 변환.
+    퍼센트(%)가 한번이라도 등장한 열은 percent_cols에 기록.
+    """
     exclude = exclude or []
     out = df.copy()
+    percent_cols: Set[str] = set()
     for c in out.columns:
         if c in exclude:
             continue
-        out[c] = out[c].apply(to_number)
-    return out
+        col_vals = []
+        saw_pct = False
+        for v in out[c].tolist():
+            num, is_pct = to_number_and_is_percent(v)
+            col_vals.append(num)
+            saw_pct = saw_pct or is_pct
+        out[c] = col_vals
+        if saw_pct:
+            percent_cols.add(c)
+    # exclude(예: 연도)는 숫자 변환 시도
+    for c in exclude:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out, percent_cols
 
-# --------- 세로/가로 구조 감지 & long 변환 ---------
+# =========================
+# 세로/가로 구조 감지 & long 변환
+# =========================
 def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     # 연도 컬럼 후보
     cols = list(df.columns)
@@ -87,13 +113,9 @@ def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if not value_cols:
         return None
 
-    df2 = df.copy()
-    # 숫자 변환
-    df2 = coerce_numeric_cols(df2, exclude=[year_col])
-    # 연도 숫자화
-    df2[year_col] = pd.to_numeric(df2[year_col], errors="coerce")
+    df2, percent_cols = coerce_numeric_cols_with_percent_map(df, exclude=[year_col])
 
-    # value_cols 중 시각화 가능한 것만 남김(유효값≥2 & 분산>0)
+    # 시각화 가능한 값 컬럼 필터(유효값 ≥2 & 분산>0)
     keep = []
     for c in value_cols:
         s = pd.to_numeric(df2[c], errors="coerce")
@@ -103,26 +125,32 @@ def to_long_vertical(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if not keep:
         return None
 
-    long = df2[[year_col] + keep].melt(id_vars=year_col, value_vars=keep,
-                                       var_name="metric", value_name="value")
+    long = df2[[year_col] + keep].melt(
+        id_vars=year_col, value_vars=keep, var_name="metric", value_name="value"
+    )
     long["value"] = pd.to_numeric(long["value"], errors="coerce")
-    long = long.dropna(subset=["value", year_col])
+    long = long.dropna(subset=["value", year_col]).sort_values([year_col, "metric"]).reset_index(drop=True)
+
     if long.empty or long[year_col].nunique() < 2:
         return None
-    long = long.sort_values([year_col, "metric"]).reset_index(drop=True)
+
+    # 메타 정보
     long.attrs["year_col"] = year_col
+    # 퍼센트 여부는 컬럼명 기준으로 기록
+    percent_metrics = {m for m in keep if m in percent_cols}
+    long.attrs["percent_metrics"] = percent_metrics
+    long.attrs["structure"] = "vertical"
     return long
 
 def to_long_horizontal(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    # 열 머리글에 연도가 2개 이상이면 가로형으로 판단
+    # 열 머리글의 연도 탐색
     year_cols = [c for c in df.columns if is_year_like(c)]
     if len(year_cols) < 2:
         return None
 
-    # 지표/항목 열(첫 번째 비연도 열) 추정
     non_year = [c for c in df.columns if c not in year_cols]
+    # 지표명 컬럼(없으면 임시)
     if not non_year:
-        # 모든 열이 연도면, 행 머리 첫 컬럼을 metric으로 가정
         metric_col = "metric"
         df2 = df.copy()
         df2.insert(0, metric_col, [f"row_{i}" for i in range(len(df2))])
@@ -130,16 +158,29 @@ def to_long_horizontal(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         metric_col = non_year[0]
         df2 = df.copy()
 
-    # 값 숫자화
-    numeric_years = [int(c) for c in year_cols]
-    for c in year_cols:
-        df2[c] = df2[c].apply(to_number)
+    # 퍼센트 맵: metric별로 % 포함 여부 판단
+    percent_metrics: Set[str] = set()
+    # melt 전에 % 탐지
+    for idx, row in df2.iterrows():
+        # metric 이름
+        mname = str(row[metric_col]).strip()
+        # 해당 행의 연도 값들 중 %가 하나라도 있으면 해당 metric은 percent로 간주
+        saw_pct = False
+        for yc in year_cols:
+            cell = row[yc]
+            if isinstance(cell, str) and "%" in cell:
+                saw_pct = True
+                break
+        if saw_pct:
+            percent_metrics.add(mname)
 
-    # 지표 이름 공백 제거
+    # 숫자 변환
+    for c in year_cols:
+        df2[c] = df2[c].apply(lambda v: to_number_and_is_percent(v)[0])
+
     df2[metric_col] = df2[metric_col].astype(str).str.strip()
 
-    long = df2.melt(id_vars=metric_col, value_vars=year_cols,
-                    var_name="year", value_name="value")
+    long = df2.melt(id_vars=metric_col, value_vars=year_cols, var_name="year", value_name="value")
     long["year"] = pd.to_numeric(long["year"], errors="coerce")
     long["value"] = pd.to_numeric(long["value"], errors="coerce")
     long = long.dropna(subset=["value", "year"])
@@ -154,33 +195,29 @@ def to_long_horizontal(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if long.empty or long["year"].nunique() < 2:
         return None
 
-    # 표준 컬럼명으로 통일
-    long = long.rename(columns={metric_col: "metric", "year": "year"})
+    long = long.rename(columns={metric_col: "metric"})
     long.attrs["year_col"] = "year"
+    long.attrs["percent_metrics"] = percent_metrics.intersection(set(ok_metrics))
+    long.attrs["structure"] = "horizontal"
     return long
 
 def pick_first_visualizable_long(tables: List[Tuple[int, pd.DataFrame]]) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
-    """
-    tables에서 시각화 가능한 long 데이터가 나올 때까지 검사.
-    반환: (page_no, df_clean, df_long)
-    """
     for pno, raw in tables:
         dfc = clean_table(raw)
-        # 1) 세로형 시도
         long_v = to_long_vertical(dfc)
         if long_v is not None:
             return pno, dfc, long_v
-        # 2) 가로형 시도
         long_h = to_long_horizontal(dfc)
         if long_h is not None:
             return pno, dfc, long_h
-    # 없으면 첫 표 반환 + 빈 long
     if tables:
         pno, raw = tables[0]
         return pno, clean_table(raw), pd.DataFrame(columns=["year", "metric", "value"])
     return -1, pd.DataFrame(), pd.DataFrame(columns=["year", "metric", "value"])
 
-# --------- PDF 테이블 추출 ---------
+# =========================
+# PDF 테이블 추출
+# =========================
 @st.cache_data(show_spinner=False)
 def extract_tables_from_pdf(path: str) -> List[Tuple[int, pd.DataFrame]]:
     results: List[Tuple[int, pd.DataFrame]] = []
@@ -205,9 +242,11 @@ def extract_tables_from_pdf(path: str) -> List[Tuple[int, pd.DataFrame]]:
                 results.append((p_idx + 1, df))
     return results
 
-# --------- UI ---------
-st.title("📄 PDF 표에서 ‘시각화 가능한 데이터’만 자동 선택 → 📊 Plotly")
-st.caption("세로/가로 표 구조를 자동 인지하고, 숫자 칼럼만 남겨 시각화합니다.")
+# =========================
+# UI
+# =========================
+st.title("📄 PDF 표 → 📊 Plotly 시각화")
+st.caption("무엇을 시각화했는지 **설명/단위**를 함께 표기합니다.")
 
 st.write(f"PDF 파일: **{PDF_FILENAME}**")
 st.caption(f"경로: `{PDF_PATH}`")
@@ -220,10 +259,9 @@ with st.spinner("PDF에서 표 추출 중…"):
     tables = extract_tables_from_pdf(PDF_PATH)
 
 if not tables:
-    st.error("표를 찾지 못했습니다. 스캔(이미지) PDF일 수 있습니다. 벡터/텍스트 기반 PDF를 사용하거나 CSV로 변환해 주세요.")
+    st.error("표를 찾지 못했습니다. 스캔(이미지) PDF일 수 있습니다.")
     st.stop()
 
-# 표 선택 목록
 table_labels = [f"p.{p} - table#{i+1} (shape={df.shape[0]}x{df.shape[1]})"
                 for i, (p, df) in enumerate(tables)]
 default_pno, default_clean, default_long = pick_first_visualizable_long(tables)
@@ -234,15 +272,17 @@ if default_pno != -1:
             default_idx = i
             break
 
-idx = st.selectbox("표 선택 (자동으로 시각화 가능한 표가 기본 선택됩니다)",
-                   options=list(range(len(tables))),
-                   index=default_idx,
-                   format_func=lambda i: table_labels[i])
+idx = st.selectbox(
+    "표 선택 (자동으로 시각화 가능한 표가 기본 선택됩니다)",
+    options=list(range(len(tables))),
+    index=default_idx,
+    format_func=lambda i: table_labels[i]
+)
 
 page_no, df_raw = tables[idx]
 df_clean = clean_table(df_raw)
 
-# 현재 선택 표에서 long 데이터 만들기(세로/가로 둘 다 시도)
+# 현재 표를 long 변환(세로→가로 순으로 시도)
 df_long_v = to_long_vertical(df_clean)
 df_long_h = to_long_horizontal(df_clean)
 df_long = df_long_v if df_long_v is not None else df_long_h
@@ -256,49 +296,106 @@ if df_long is None or df_long.empty:
     st.stop()
 
 year_col = df_long.attrs.get("year_col", "year")
-st.caption(f"인식된 연도 컬럼: **{year_col}**")
+percent_metrics: Set[str] = df_long.attrs.get("percent_metrics", set())
+structure = df_long.attrs.get("structure", "unknown")
 
-# 시각화 가능한 metric만 남음 → 사용자가 선택 가능
 metrics_all = sorted(df_long["metric"].dropna().unique().tolist())
-# 데이터 포인트(연도) 수 기준으로 상위 metrics 추려 기본 선택
+# 기본 선택: 데이터 포인트 많은 것 위주
 metric_scores: Dict[str, int] = {m: df_long[df_long["metric"] == m][year_col].nunique() for m in metrics_all}
 metrics_sorted = sorted(metrics_all, key=lambda m: (-metric_scores[m], m))
 default_metrics = metrics_sorted[: min(5, len(metrics_sorted))]
 
-selected_metrics = st.multiselect(
-    "시각화할 지표 선택(최소 1개)",
-    options=metrics_all,
-    default=default_metrics
-)
+selected_metrics = st.multiselect("시각화할 지표 선택(최소 1개)", options=metrics_all, default=default_metrics)
 if not selected_metrics:
     st.info("한 개 이상 지표를 선택하세요.")
     st.stop()
 
+# 단위 토글: 인식된 퍼센트 지표만 %로 보기
+show_percent = st.checkbox("퍼센트 지표를 %로 보기(그 외 지표는 원값 유지)", value=True)
+
 df_plot = df_long[df_long["metric"].isin(selected_metrics)].copy()
 
-# 연도 범위 안내
-years_nonnull = df_plot[year_col].dropna()
-if not years_nonnull.empty:
-    st.caption(f"연도 범위: **{int(years_nonnull.min())}–{int(years_nonnull.max())}**")
+# % 표시 지표만 배율 100 적용
+if show_percent and percent_metrics:
+    df_plot["display_value"] = df_plot.apply(
+        lambda r: (r["value"] * 100.0) if r["metric"] in percent_metrics else r["value"], axis=1
+    )
+    y_label = "value / % (혼합)"
+else:
+    df_plot["display_value"] = df_plot["value"]
+    y_label = "value"
 
-# --------- Plotly 시각화 ---------
+# 연도 범위/요약
+yr_nonnull = df_plot[year_col].dropna()
+year_min = int(yr_nonnull.min()) if not yr_nonnull.empty else None
+year_max = int(yr_nonnull.max()) if not yr_nonnull.empty else None
+
+# =========================
+# 📌 설명 패널 (무엇을 시각화했는가?)
+# =========================
+desc_rows = []
+for m in selected_metrics:
+    cnt = df_plot[df_plot["metric"] == m][year_col].nunique()
+    unit = "%" if (m in percent_metrics and show_percent) else ("(비율 0–1)" if m in percent_metrics else "(값)")
+    desc_rows.append({"metric": m, "points": cnt, "unit_shown": unit})
+
+st.subheader("📝 무엇을 시각화했나요?")
+st.markdown(
+    f"""
+- **원본**: `{PDF_FILENAME}`, **페이지**: p.{page_no}, **표 구조**: {structure}
+- **연도 컬럼**: `{year_col}` | **연도 범위**: **{year_min}–{year_max}**
+- **선택 지표({len(selected_metrics)}개)**: {", ".join(selected_metrics)}
+- **퍼센트 인식 지표**: {", ".join(sorted(percent_metrics)) if percent_metrics else "없음"}
+  - 퍼센트 인식 지표는 내부 저장 시 `0–1` 스케일로 변환됩니다.
+  - ✅ 옵션 ‘퍼센트 지표를 %로 보기’를 켜면, 해당 지표만 **×100** 하여 **% 단위**로 표시합니다.
+"""
+)
+st.dataframe(pd.DataFrame(desc_rows), use_container_width=True, height=180)
+
+# =========================
+# Plotly 시각화 (설명 포함 타이틀/호버)
+# =========================
+title_suffix = f"(p.{page_no} · {year_min}–{year_max} · {len(selected_metrics)} metrics)"
+
 st.subheader("📈 시계열 라인 차트")
 fig_line = px.line(
-    df_plot, x=year_col, y="value", color="metric",
-    markers=True, title="Selected Metrics Over Time"
+    df_plot,
+    x=year_col, y="display_value", color="metric", markers=True,
+    title=f"Selected Metrics Over Time {title_suffix}"
 )
-fig_line.update_layout(xaxis_title=str(year_col), yaxis_title="value", hovermode="x unified", margin=dict(t=60))
+hover_unit = "%{customdata}"  # 각 포인트 단위 표시용
+# customdata: 각 점에 대해 단위 결정
+df_plot_sorted = df_plot.sort_values([year_col, "metric"]).copy()
+df_plot_sorted["unit_str"] = df_plot_sorted["metric"].apply(
+    lambda m: "%" if (m in percent_metrics and show_percent) else ""
+)
+fig_line.update_traces(
+    customdata=df_plot_sorted["unit_str"],
+    hovertemplate="<b>%{fullData.name}</b><br>"
+                  + f"{year_col}=%{{x}}<br>"
+                  + "value=%{y:.3f}" + " %{customdata}<extra></extra>"
+)
+fig_line.update_layout(xaxis_title=str(year_col), yaxis_title=y_label, hovermode="x unified", margin=dict(t=60))
 st.plotly_chart(fig_line, use_container_width=True)
 
 st.subheader("📊 연도별 막대 차트")
 bar_mode = st.radio("막대 모드", options=["group", "stack"], horizontal=True, index=0)
 fig_bar = px.bar(
-    df_plot, x=year_col, y="value", color="metric", barmode=bar_mode, title="Yearly Values"
+    df_plot, x=year_col, y="display_value", color="metric", barmode=bar_mode,
+    title=f"Yearly Values {title_suffix}"
 )
-fig_bar.update_layout(xaxis_title=str(year_col), yaxis_title="value", hovermode="x unified", margin=dict(t=60))
+fig_bar.update_traces(
+    customdata=df_plot_sorted["unit_str"],
+    hovertemplate="<b>%{fullData.name}</b><br>"
+                  + f"{year_col}=%{{x}}<br>"
+                  + "value=%{y:.3f}" + " %{customdata}<extra></extra>"
+)
+fig_bar.update_layout(xaxis_title=str(year_col), yaxis_title=y_label, hovermode="x unified", margin=dict(t=60))
 st.plotly_chart(fig_bar, use_container_width=True)
 
-# --------- 다운로드 ---------
+# =========================
+# 다운로드
+# =========================
 st.subheader("⬇️ 데이터 다운로드")
 st.download_button(
     "전처리 표 CSV 내려받기",
@@ -306,19 +403,19 @@ st.download_button(
     file_name="table_cleaned.csv",
     mime="text/csv"
 )
+# 시각화에 실제 사용한 subset + 표시값 포함
+export_cols = [year_col, "metric", "value", "display_value"]
 st.download_button(
-    "long 포맷 CSV 내려받기 (시각화용)",
-    data=df_plot.to_csv(index=False).encode("utf-8-sig"),
-    file_name="table_long_visualizable.csv",
+    "시각화용 long CSV 내려받기 (표시값 포함)",
+    data=df_plot[export_cols].to_csv(index=False).encode("utf-8-sig"),
+    file_name="table_long_visualized.csv",
     mime="text/csv"
 )
 
 with st.expander("ℹ️ 동작 원리 / 한계"):
     st.markdown("""
-- 표 구조 자동 인식
-  - **세로형**: (연도 컬럼 1개 + 수치 컬럼 N개) → long 변환  
-  - **가로형**: (열 머리글이 연도 다수) → 첫 비연도 열을 **지표명**으로 보고 long 변환  
-- 숫자 인식: 콤마/퍼센트(%) 처리. 퍼센트는 **0~1 스케일**로 환산합니다.  
-- 시각화 가능 기준: **유효값 ≥ 2**이고 **분산>0**인 시리즈만 사용합니다.  
+- **무엇을 시각화했는가**가 항상 보이도록: 표 페이지/구조/연도범위/지표/단위를 상단에 요약합니다.  
+- 퍼센트(%)는 내부적으로 0–1 스케일로 변환되며, 토글을 통해 %로 표시할 수 있습니다(퍼센트 지표에만 적용).  
+- 시각화 가능한 지표 기준: **유효값 ≥ 2** & **분산 > 0**.  
 - 스캔(이미지) PDF는 표 추출이 어려울 수 있습니다.
 """)
